@@ -1,0 +1,104 @@
+# -- coding: utf-8 --
+"""
+Loan Prediction HFL Simulation (Colab, 12 Clients, ALL Sampled, Uneven Non-IID, 10 Rounds)
+WITH DYNAMIC THRESHOLD and ACCURACY SMOOTHING
+"""
+
+# --- Essential Imports ---
+import pandas as pd
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.impute import SimpleImputer
+from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
+import copy
+import time
+import warnings
+import matplotlib.pyplot as plt
+import random
+
+warnings.filterwarnings('ignore', category=pd.errors.SettingWithCopyWarning)
+warnings.filterwarnings('ignore', category=FutureWarning)
+print(f"PyTorch Version: {torch.__version__}")
+
+# --- Configuration Constants ---
+print("\n--- Configuration ---")
+DATASET_FILENAME = 'Loan_default.csv'; SAMPLE_SIZE = 10000; NUM_CLIENTS = 12; NUM_MIDDLE_SERVERS = 3; COMMUNICATION_ROUNDS = 10
+LOCAL_EPOCHS = 40; LEARNING_RATE = 0.001; NUM_SAMPLED_CLIENTS_PER_ROUND = NUM_CLIENTS; BATCH_SIZE = 32; TEST_SPLIT_RATIO = 0.2; RANDOM_STATE = 42; TARGET_COLUMN = 'Default'
+# <<< MODIFICATION: Renamed to DEFAULT, as it's no longer always used >>>
+DEFAULT_MIDDLE_SERVER_ACCURACY_THRESHOLD = 80.0
+print(f"Total Clients: {NUM_CLIENTS}, Middle Servers: {NUM_MIDDLE_SERVERS}"); print(f"Clients Trained per Round: ALL ({NUM_SAMPLED_CLIENTS_PER_ROUND})")
+print(f"Local Epochs: {LOCAL_EPOCHS} (Increased for better convergence)"); print(f"Federated Strategy: Weighted Averaging (FedAvg)")
+print(f"Evaluation Rule: Accuracy Smoothing (lowest/highest performers are adjusted)")
+# <<< MODIFICATION: Updated print statement to reflect new dynamic rule >>>
+print(f"Middle Server Exclusion Threshold: Dynamic (R1-5: None, R6-7: Prev. Global Acc - 15, R8+: {DEFAULT_MIDDLE_SERVER_ACCURACY_THRESHOLD}%)")
+
+
+# --- 1. Data Loading, Sampling, and Preprocessing ---
+print("\n--- 1. Data Loading, Sampling, and Preprocessing ---")
+try:
+    df_full = pd.read_csv(DATASET_FILENAME)
+except FileNotFoundError: raise FileNotFoundError(f"ERROR: Dataset file '{DATASET_FILENAME}' not found.")
+if len(df_full) >= SAMPLE_SIZE: df = df_full.sample(n=SAMPLE_SIZE, random_state=RANDOM_STATE).reset_index(drop=True)
+else: df = df_full.reset_index(drop=True)
+def preprocess_data(df_input, target_col_name):
+    if 'LoanID' in df_input.columns: df_processed = df_input.drop('LoanID', axis=1)
+    else: df_processed = df_input.copy()
+    y = df_processed[target_col_name].copy(); X_df = df_processed.drop(target_col_name, axis=1); y = pd.to_numeric(y, errors='coerce').astype(int)
+    numerical_cols = X_df.select_dtypes(include=np.number).columns.tolist(); categorical_cols = X_df.select_dtypes(include='object').columns.tolist()
+    if numerical_cols and X_df[numerical_cols].isnull().sum().sum() > 0: num_imputer = SimpleImputer(strategy='median'); X_df[numerical_cols] = num_imputer.fit_transform(X_df[numerical_cols])
+    if categorical_cols and X_df[categorical_cols].isnull().sum().sum() > 0: cat_imputer = SimpleImputer(strategy='most_frequent'); X_df[categorical_cols] = cat_imputer.fit_transform(X_df[categorical_cols])
+    if categorical_cols: X_encoded = pd.get_dummies(X_df, columns=categorical_cols, drop_first=True, dtype=float)
+    else: X_encoded = X_df.copy()
+    scaler = StandardScaler(); X_encoded[X_encoded.columns] = scaler.fit_transform(X_encoded[X_encoded.columns])
+    return X_encoded.values.astype(np.float32), y.values, X_encoded.shape[1]
+X_processed, y_processed, INPUT_DIM = preprocess_data(df, TARGET_COLUMN)
+X_train_full, X_test, y_train_full, y_test = train_test_split(
+    X_processed, y_processed, test_size=TEST_SPLIT_RATIO, random_state=RANDOM_STATE, stratify=y_processed)
+X_test_tensor = torch.tensor(X_test, dtype=torch.float32); y_test_tensor = torch.tensor(y_test, dtype=torch.long)
+
+# --- 2. Define ENHANCED Neural Network ---
+print("\n--- 2. Defining ENHANCED (Deeper) Neural Network ---")
+class LoanPredictorNN(nn.Module):
+    def __init__(self, input_dim):
+        super(LoanPredictorNN, self).__init__()
+        self.layer_1 = nn.Linear(input_dim, 256); self.relu_1 = nn.ReLU(); self.batchnorm_1 = nn.BatchNorm1d(256); self.dropout_1 = nn.Dropout(0.5)
+        self.layer_2 = nn.Linear(256, 128); self.relu_2 = nn.ReLU(); self.batchnorm_2 = nn.BatchNorm1d(128); self.dropout_2 = nn.Dropout(0.4)
+        self.layer_3 = nn.Linear(128, 64); self.relu_3 = nn.ReLU(); self.batchnorm_3 = nn.BatchNorm1d(64); self.dropout_3 = nn.Dropout(0.3)
+        self.layer_4 = nn.Linear(64, 32); self.relu_4 = nn.ReLU(); self.batchnorm_4 = nn.BatchNorm1d(32); self.dropout_4 = nn.Dropout(0.2)
+        self.output_layer = nn.Linear(32, 2)
+    def forward(self, x):
+        x = self.layer_1(x); x = self.relu_1(self.batchnorm_1(x)); x = self.dropout_1(x)
+        x = self.layer_2(x); x = self.relu_2(self.batchnorm_2(x)); x = self.dropout_2(x)
+        x = self.layer_3(x); x = self.relu_3(self.batchnorm_3(x)); x = self.dropout_3(x)
+        x = self.layer_4(x); x = self.relu_4(self.batchnorm_4(x)); x = self.dropout_4(x)
+        x = self.output_layer(x); return x
+print("Neural Network defined.")
+
+# --- 3. Client Data Splitting ---
+print("\n--- 3. Splitting Training Data for Clients ---")
+def split_data_non_iid_uneven(X, y, num_clients, min_samples=20, power_law_factor=1.6):
+    n_samples = len(X); proportions = np.random.power(power_law_factor, num_clients); proportions /= proportions.sum()
+    client_sizes = (proportions * n_samples).astype(int); client_sizes = np.maximum(min_samples, client_sizes); diff = n_samples - client_sizes.sum()
+    if diff > 0: client_sizes[:diff] += 1
+    elif diff < 0:
+      eligible_indices = np.where(client_sizes > min_samples)[0]
+      for i in range(abs(diff)): client_sizes[random.choice(eligible_indices)] -= 1
+    client_sizes[-1] += (n_samples-client_sizes.sum()); assert client_sizes.sum() == n_samples
+    indices = np.arange(n_samples); np.random.seed(RANDOM_STATE); np.random.shuffle(indices); client_data = {}; current_idx = 0
+    for i in range(num_clients):
+        client_size = client_sizes[i]; client_indices = indices[current_idx : current_idx + client_size]; client_X = X[client_indices]; client_y = np.array(y)[client_indices]
+        client_data[f'client_{i+1}'] = (torch.tensor(client_X, dtype=torch.float32), torch.tensor(client_y, dtype=torch.long)); current_idx += client_size
+    return client_data
+clients_data = split_data_non_iid_uneven(X_train_full, y_train_full, num_clients=NUM_CLIENTS)
+print("Data splitting complete.")
+
+# --- 4. Client Class ---
+print("\n--- 4. Defining Client Class ---")
+class Client:
+    def __init__(self, client_id, data, input_dim, lr=LEARNING_RATE, batch_size=BATCH_SIZE):
+        self.client_id = client_id; self.batch_size = batch_size; self.X, self.y = data; self.has_data = len(self.X) > 0; self.data_loader = None
+        if self.has_data: self.data_loader = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(self.X, self.y
